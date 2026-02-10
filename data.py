@@ -4,119 +4,20 @@ from pathlib import Path
 from typing import Tuple, Dict
 import re
 from io import StringIO
+import numpy as np
 
 DATA_DIR = Path(__file__).parent / "data"
 
 
-def load_datasets() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_datasets() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Load datasets from PCL and category files, split by provided CSV files.
     
-    # Load text data and category annotations
-    print("Loading text data from dontpatronizeme_categories.tsv...")
-    cat_path = DATA_DIR / "dontpatronizeme_categories.tsv"
-    # Read file and keep only the actual data rows (skip disclaimer/header lines)
-    with open(cat_path, "r", encoding="utf-8") as fh:
-        raw_lines = fh.readlines()
-
-    data_lines = [ln for ln in raw_lines if re.match(r"^\d+\t@@", ln)]
-
-    if not data_lines:
-        # Fallback: try to read entire file as TSV
-        cat_df = pd.read_csv(cat_path, sep="\t", header=None, engine="python")
-    else:
-        names = [
-            "par_id",
-            "text_id",
-            "text",
-            "keyword",
-            "country",
-            "start",
-            "end",
-            "span_text",
-            "category",
-            "score",
-        ]
-        cat_df = pd.read_csv(
-            StringIO("".join(data_lines)),
-            sep="\t",
-            header=None,
-            names=names,
-            engine="python",
-        )
-
-    # Keep only unique paragraphs (first occurrence of par_id)
-    cat_df['par_id'] = pd.to_numeric(cat_df['par_id'], errors='coerce').astype('Int64')
-    cat_df['score'] = pd.to_numeric(cat_df['score'], errors='coerce').astype('Int64')
-    text_lookup = (
-        cat_df.loc[cat_df['par_id'].notna(), ['par_id', 'text']]
-        .drop_duplicates(subset=['par_id'])
-        .set_index('par_id')
-    )
+    Returns:
+        train_df, val_df, dev_df, test_df
+    """
     
-    # Aggregate category scores per paragraph (max score per category)
-    print("Aggregating category scores...")
-    category_scores = {}
-    for par_id, group in cat_df[cat_df['par_id'].notna()].groupby('par_id'):
-        categories_dict = {}
-        for _, row in group.iterrows():
-            category = row['category']
-            score = row['score']
-            if pd.notna(category) and pd.notna(score):
-                # Keep max score for each category
-                if category not in categories_dict:
-                    categories_dict[category] = score
-                else:
-                    categories_dict[category] = max(categories_dict[category], score)
-        category_scores[par_id] = categories_dict
-    
-    # Load PCL scores
-    print("Loading PCL scores from dontpatronizeme_pcl.tsv...")
-    pcl_path = DATA_DIR / "dontpatronizeme_pcl.tsv"
-    with open(pcl_path, "r", encoding="utf-8") as fh:
-        raw_lines = fh.readlines()
-    
-    pcl_data_lines = [ln for ln in raw_lines if re.match(r"^\d+\t@@", ln)]
-    
-    if pcl_data_lines:
-        pcl_names = [
-            "par_id",
-            "text_id",
-            "keyword",
-            "country",
-            "text",
-            "pcl_score",
-        ]
-        pcl_df = pd.read_csv(
-            StringIO("".join(pcl_data_lines)),
-            sep="\t",
-            header=None,
-            names=pcl_names,
-            engine="python",
-        )
-        pcl_df['par_id'] = pd.to_numeric(pcl_df['par_id'], errors='coerce').astype('Int64')
-        pcl_df['pcl_score'] = pd.to_numeric(pcl_df['pcl_score'], errors='coerce').astype('Int64')
-        pcl_lookup = pcl_df[['par_id', 'pcl_score']].drop_duplicates(subset=['par_id']).set_index('par_id')
-    else:
-        pcl_lookup = pd.DataFrame()
-    
-    # Load train labels
-    print("Loading train labels...")
-    train_labels = pd.read_csv(DATA_DIR / "train_semeval_parids-labels.csv")
-    train_labels['par_id'] = train_labels['par_id'].astype(int)
-    # Parse label string to list
-    train_labels['label'] = train_labels['label'].apply(literal_eval)
-    # Merge with text
-    train_df = train_labels.merge(
-        text_lookup.reset_index(),
-        on='par_id',
-        how='left'
-    )[['par_id', 'text', 'label']]
-    
-    # Add PCL score
-    train_df['pcl_score'] = train_df['par_id'].map(
-        lambda x: pcl_lookup.loc[x, 'pcl_score'] if x in pcl_lookup.index else None
-    )
-    
-    # Map original category names to abbreviations and add as separate columns
+    # Category mapping
     category_map = {
         'Unbalanced_power_relations': 'unb',
         'Shallow_solution': 'shal',
@@ -127,37 +28,80 @@ def load_datasets() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         'The_poorer_the_merrier': 'merr'
     }
     category_cols = list(category_map.values())
-
-    for long_name, abbr in category_map.items():
-        train_df[abbr] = train_df['par_id'].map(
-            lambda x, ln=long_name: category_scores.get(x, {}).get(ln, 0)
-        )
     
-    # Load dev labels
-    print("Loading dev labels...")
-    dev_labels = pd.read_csv(DATA_DIR / "dev_semeval_parids-labels.csv")
-    dev_labels['par_id'] = dev_labels['par_id'].astype(int)
-    # Parse label string to list
-    dev_labels['label'] = dev_labels['label'].apply(literal_eval)
-    # Merge with text
-    dev_df = dev_labels.merge(
-        text_lookup.reset_index(),
-        on='par_id',
-        how='left'
-    )[['par_id', 'text', 'label']]
+    # 1. Load PCL data (text and PCL scores)
+    print("Loading PCL data from dontpatronizeme_pcl.tsv...")
+    pcl_path = DATA_DIR / "dontpatronizeme_pcl.tsv"
+    with open(pcl_path, "r", encoding="utf-8") as fh:
+        pcl_lines = [ln for ln in fh if re.match(r"^\d+\t@@", ln)]
     
-    # Add PCL score
-    dev_df['pcl_score'] = dev_df['par_id'].map(
-        lambda x: pcl_lookup.loc[x, 'pcl_score'] if x in pcl_lookup.index else None
+    pcl_df = pd.read_csv(
+        StringIO("".join(pcl_lines)),
+        sep="\t",
+        header=None,
+        names=["par_id", "text_id", "keyword", "country", "text", "pcl_score"],
+        engine="python",
     )
+    pcl_df['par_id'] = pcl_df['par_id'].astype(int)
+    pcl_df['pcl_score'] = pd.to_numeric(pcl_df['pcl_score'], errors='coerce').fillna(0).astype(int)
     
-    # Add category scores as separate columns (using abbreviations)
-    for long_name, abbr in category_map.items():
-        dev_df[abbr] = dev_df['par_id'].map(
-            lambda x, ln=long_name: category_scores.get(x, {}).get(ln, 0)
-        )
+    # Keep one row per par_id (text and pcl_score)
+    pcl_data = pcl_df[['par_id', 'text', 'pcl_score']].drop_duplicates(subset=['par_id'])
     
-    # Load test data (no labels)
+    # 2. Load category data
+    print("Loading category data from dontpatronizeme_categories.tsv...")
+    cat_path = DATA_DIR / "dontpatronizeme_categories.tsv"
+    with open(cat_path, "r", encoding="utf-8") as fh:
+        cat_lines = [ln for ln in fh if re.match(r"^\d+\t@@", ln)]
+    
+    cat_df = pd.read_csv(
+        StringIO("".join(cat_lines)),
+        sep="\t",
+        header=None,
+        names=["par_id", "text_id", "text", "keyword", "country", "start", "end", "span_text", "category", "score"],
+        engine="python",
+    )
+    cat_df['par_id'] = cat_df['par_id'].astype(int)
+    cat_df['score'] = pd.to_numeric(cat_df['score'], errors='coerce').fillna(0).astype(int)
+    
+    # Aggregate category scores per paragraph (max score per category)
+    category_data = {}
+    for par_id, group in cat_df.groupby('par_id'):
+        category_data[par_id] = {}
+        for _, row in group.iterrows():
+            category = row['category']
+            score = row['score']
+            if pd.notna(category):
+                abbr = category_map.get(category)
+                if abbr:
+                    category_data[par_id][abbr] = max(category_data[par_id].get(abbr, 0), score)
+    
+    # Add category columns to pcl_data
+    for abbr in category_cols:
+        pcl_data[abbr] = pcl_data['par_id'].map(lambda x: category_data.get(x, {}).get(abbr, 0))
+    
+    # 3. Split into train/dev/test using CSV files
+    print("Loading train/dev split files...")
+    train_ids_df = pd.read_csv(DATA_DIR / "train_semeval_parids-labels.csv")
+    train_ids_df['par_id'] = train_ids_df['par_id'].astype(int)
+    train_ids_df['label'] = train_ids_df['label'].apply(literal_eval)
+    
+    dev_ids_df = pd.read_csv(DATA_DIR / "dev_semeval_parids-labels.csv")
+    dev_ids_df['par_id'] = dev_ids_df['par_id'].astype(int)
+    dev_ids_df['label'] = dev_ids_df['label'].apply(literal_eval)
+    
+    # Merge with PCL data
+    train_df = train_ids_df.merge(pcl_data, on='par_id', how='left')
+    dev_df = dev_ids_df.merge(pcl_data, on='par_id', how='left')
+    
+    # Fill missing values
+    train_df['pcl_score'] = train_df['pcl_score'].fillna(0).astype(int)
+    dev_df['pcl_score'] = dev_df['pcl_score'].fillna(0).astype(int)
+    for abbr in category_cols:
+        train_df[abbr] = train_df[abbr].fillna(0).astype(int)
+        dev_df[abbr] = dev_df[abbr].fillna(0).astype(int)
+    
+    # Load test data
     print("Loading test data...")
     test_df = pd.read_csv(
         DATA_DIR / "task4_test.tsv",
@@ -165,22 +109,24 @@ def load_datasets() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         header=None,
         names=['test_id', 'text_id', 'keyword', 'country', 'text']
     )
-    
-    # Add PCL score as None for test set
-    test_df['pcl_score'] = None
-    
-    # Add category scores as separate columns (all 0 for test set, abbreviations)
+    test_df['pcl_score'] = 0
     for abbr in category_cols:
         test_df[abbr] = 0
     
-    print(f"Train set: {len(train_df)} samples")
+    # 4. Split train into train (80%) and validation (20%)
+    val_idx = np.random.choice(train_df.index, size=int(0.2 * len(train_df)), replace=False)
+    val_df = train_df.loc[val_idx].copy().reset_index(drop=True)
+    train_df = train_df.drop(val_idx).copy().reset_index(drop=True)
+    
+    print(f"Train set: {len(train_df)} samples (80%)")
+    print(f"Validation set: {len(val_df)} samples (20%)")
     print(f"Dev set: {len(dev_df)} samples")
     print(f"Test set: {len(test_df)} samples")
     
-    return train_df, dev_df, test_df
+    return train_df, val_df, dev_df, test_df
 
 
-def print_label_statistics(df: pd.DataFrame) -> Dict[str, int]:
+def print_label_distribution(df: pd.DataFrame) -> Dict[str, int]:
     """Get distribution of labels in the dataset."""
     num_positive = [score > 0 for score in df['pcl_score']]
     total_samples = len(num_positive)
@@ -251,11 +197,15 @@ def print_label_statistics(df: pd.DataFrame) -> Dict[str, int]:
 
 
 if __name__ == "__main__":
-    train, dev, test = load_datasets()
+    train, val, dev, test = load_datasets()
     
     print("\n--- Train Set ---")
     print(train.head())
     print(f"\nTrain shape: {train.shape}")
+    
+    print("\n--- Validation Set ---")
+    print(val.head())
+    print(f"\nValidation shape: {val.shape}")
     
     print("\n--- Dev Set ---")
     print(dev.head())
@@ -266,4 +216,4 @@ if __name__ == "__main__":
     print(f"\nTest shape: {test.shape}")
     
     print("\nLabel distribution in Train set:")
-    print_label_statistics(train)
+    print_label_distribution(train)
