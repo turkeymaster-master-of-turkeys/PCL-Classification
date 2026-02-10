@@ -94,7 +94,19 @@ def load_datasets() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFr
     train_df = train_ids_df.merge(pcl_data, on='par_id', how='left')
     dev_df = dev_ids_df.merge(pcl_data, on='par_id', how='left')
     
-    # Fill missing values
+    # Drop rows with missing text (can't tokenize NaN)
+    train_before = len(train_df)
+    dev_before = len(dev_df)
+    train_df = train_df.dropna(subset=['text']).reset_index(drop=True)
+    dev_df = dev_df.dropna(subset=['text']).reset_index(drop=True)
+    train_dropped = train_before - len(train_df)
+    dev_dropped = dev_before - len(dev_df)
+    if train_dropped > 0:
+        print(f"  Warning: Dropped {train_dropped} train samples with missing text")
+    if dev_dropped > 0:
+        print(f"  Warning: Dropped {dev_dropped} dev samples with missing text")
+    
+    # Fill missing values for scores
     train_df['pcl_score'] = train_df['pcl_score'].fillna(0).astype(int)
     dev_df['pcl_score'] = dev_df['pcl_score'].fillna(0).astype(int)
     for abbr in category_cols:

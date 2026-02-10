@@ -1,8 +1,10 @@
 import pandas as pd
 import argparse
+import numpy as np
 from sklearn.metrics import (
     f1_score, precision_score, recall_score, 
-    accuracy_score, hamming_loss
+    accuracy_score, hamming_loss, mean_squared_error,
+    mean_absolute_error, roc_auc_score
 )
 
 from data import load_datasets
@@ -30,10 +32,16 @@ def main():
     print(f"Dev set size: {len(dev_df)}")
     
     # Merge predictions with ground truth based on par_id
-    merged = preds_df.merge(dev_df[['par_id'] + categories], on='par_id', suffixes=('_pred', '_true'))
+    merged = preds_df.merge(dev_df[['par_id', 'pcl_score'] + categories], on='par_id', suffixes=('_pred', '_true'))
     print(f"Merged size: {len(merged)}")
     
-    # Extract predicted scores and ground truth labels
+    # Extract PCL predictions and ground truth
+    pcl_pred_scores = merged['pcl'].values  # 'pcl' doesn't get renamed since no collision
+    pcl_true_scores = merged['pcl_score'].values
+    pcl_true_binary = (pcl_true_scores > 0).astype(int)
+    pcl_pred_binary = (pcl_pred_scores >= args.threshold).astype(int)
+    
+    # Extract category predicted scores and ground truth labels
     y_pred_scores = merged[[f'{cat}_pred' for cat in categories]].values
     y_true = (merged[[f'{cat}_true' for cat in categories]] > 0).astype(int).values
     
@@ -44,8 +52,35 @@ def main():
     print(f"EVALUATION RESULTS (threshold={args.threshold})")
     print(f"{'='*60}\n")
     
-    # Overall metrics
-    print("OVERALL METRICS:")
+    # PCL Classification Metrics (PRIMARY TASK)
+    print("PCL CLASSIFICATION METRICS (PRIMARY TASK):")
+    print(f"  Binary Accuracy: {accuracy_score(pcl_true_binary, pcl_pred_binary):.4f}")
+    print(f"  Binary F1:       {f1_score(pcl_true_binary, pcl_pred_binary, zero_division=0):.4f}")
+    print(f"  Precision:       {precision_score(pcl_true_binary, pcl_pred_binary, zero_division=0):.4f}")
+    print(f"  Recall:          {recall_score(pcl_true_binary, pcl_pred_binary, zero_division=0):.4f}")
+    try:
+        print(f"  ROC-AUC:         {roc_auc_score(pcl_true_binary, pcl_pred_scores):.4f}")
+    except:
+        print(f"  ROC-AUC:         N/A (only one class present)")
+    print(f"  MSE (vs score):  {mean_squared_error(pcl_true_scores, pcl_pred_scores):.4f}")
+    print(f"  MAE (vs score):  {mean_absolute_error(pcl_true_scores, pcl_pred_scores):.4f}")
+    
+    # PCL score distribution
+    print(f"\n  Ground Truth Distribution:")
+    for score in sorted(np.unique(pcl_true_scores)):
+        count = (pcl_true_scores == score).sum()
+        pct = count / len(pcl_true_scores) * 100
+        print(f"    Score {int(score)}: {count:4d} ({pct:5.1f}%)")
+    
+    print(f"\n  Prediction Statistics:")
+    print(f"    Mean: {pcl_pred_scores.mean():.4f}")
+    print(f"    Std:  {pcl_pred_scores.std():.4f}")
+    print(f"    Predicted Positive: {pcl_pred_binary.sum()} / {len(pcl_pred_binary)} ({pcl_pred_binary.sum()/len(pcl_pred_binary)*100:.1f}%)")
+    print(f"    True Positive:      {pcl_true_binary.sum()} / {len(pcl_true_binary)} ({pcl_true_binary.sum()/len(pcl_true_binary)*100:.1f}%)")
+    
+    # Category Overall metrics
+    print(f"\n{'='*60}")
+    print("CATEGORY CLASSIFICATION - OVERALL METRICS:")
     print(f"  Micro F1:      {f1_score(y_true, y_pred, average='micro', zero_division=0):.4f}")
     print(f"  Macro F1:      {f1_score(y_true, y_pred, average='macro', zero_division=0):.4f}")
     print(f"  Weighted F1:   {f1_score(y_true, y_pred, average='weighted', zero_division=0):.4f}")
@@ -58,7 +93,7 @@ def main():
     
     # Per-category metrics
     print(f"\n{'='*60}")
-    print("PER-CATEGORY METRICS:")
+    print("CATEGORY CLASSIFICATION - PER-CATEGORY METRICS:")
     print(f"{'='*60}")
     print(f"{'Category':<10} {'Prec':>8} {'Recall':>8} {'F1':>8} {'Support':>8}")
     print(f"{'-'*60}")

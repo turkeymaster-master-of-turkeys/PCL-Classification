@@ -65,7 +65,8 @@ def main():
     
     # Generate predictions
     print("Generating predictions...")
-    all_predictions = []
+    all_category_predictions = []
+    all_pcl_predictions = []
     
     with torch.no_grad():
         for input_ids, attention_mask in dev_loader:
@@ -75,26 +76,37 @@ def main():
             # Forward pass (sigmoid is applied automatically in eval mode)
             preds_dict = model(input_ids, attention_mask)
             
-            # Stack predictions in category order
-            preds = torch.stack([preds_dict[cat] for cat in categories], dim=1)
-            all_predictions.append(preds.cpu())
+            # Stack category predictions in category order
+            category_preds = torch.stack([preds_dict[cat] for cat in categories], dim=1)
+            all_category_predictions.append(category_preds.cpu())
+            
+            # Get PCL predictions
+            pcl_preds = preds_dict['pcl']
+            all_pcl_predictions.append(pcl_preds.cpu())
     
     # Concatenate all predictions
-    all_predictions = torch.cat(all_predictions, dim=0).numpy()
+    all_category_predictions = torch.cat(all_category_predictions, dim=0).numpy()
+    all_pcl_predictions = torch.cat(all_pcl_predictions, dim=0).numpy()
     
     # Create output dataframe
     results = pd.DataFrame({
-        'par_id': dev_df['par_id'].values
+        'par_id': dev_df['par_id'].values,
+        'pcl': all_pcl_predictions  # PCL prediction first (main task)
     })
     
     # Add predicted scores for each category
     for idx, category in enumerate(categories):
-        results[category] = all_predictions[:, idx]
+        results[category] = all_category_predictions[:, idx]
     
     # Save to CSV
     results.to_csv(args.output, index=False)
     print(f"\nPredictions saved to: {args.output}")
     print(f"Output shape: {results.shape}")
+    print(f"\nPCL prediction statistics:")
+    print(f"  Mean: {all_pcl_predictions.mean():.4f}")
+    print(f"  Std:  {all_pcl_predictions.std():.4f}")
+    print(f"  Min:  {all_pcl_predictions.min():.4f}")
+    print(f"  Max:  {all_pcl_predictions.max():.4f}")
     print("\nSample predictions:")
     print(results.head())
 

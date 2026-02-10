@@ -1,8 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 
 from transformers import DistilBertTokenizer, DistilBertModel
+from peft import LoraConfig, get_peft_model
+
+# Silence DistilBERT loading info about unused MLM head weights
+logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 
 
 categories = [
@@ -57,7 +62,7 @@ class AttentionClassifier(nn.Module):
         out = {category: logits[:, idx] for idx, category in enumerate(categories)}
         
         # PCL prediction from original pooled representation
-        pcl_out = self.pcl_head(x).squeeze(-1)  # Shape: (batch_size,)
+        pcl_out = self.pcl_head(x_tokens.mean(dim=1)).squeeze(-1)  # Shape: (batch_size,)
         out['pcl'] = pcl_out
         return out
 
@@ -65,8 +70,23 @@ class AttentionClassifier(nn.Module):
 class PCLModel(nn.Module):
     def __init__(self, classifier, pretrained_model_name: str = 'distilbert-base-uncased'):
         super(PCLModel, self).__init__()
-        self.bert = DistilBertModel.from_pretrained(pretrained_model_name)
+        base_model = DistilBertModel.from_pretrained(pretrained_model_name)
+        
+        # Apply LoRA to q_lin and v_lin layers in attention
+        lora_config = LoraConfig(
+            r=8,  # rank of the low-rank matrices
+            lora_alpha=16,  # scaling factor
+            target_modules=["q_lin", "v_lin"],  # apply to query and value projections
+            lora_dropout=0.1,
+            bias="none",
+            task_type=None  # for feature extraction, not specific task
+        )
+        
+        self.bert = get_peft_model(base_model, lora_config)
         self.classifier = classifier
+        
+        # Print trainable parameters
+        self.bert.print_trainable_parameters()
 
     def forward(self, input_ids, attention_mask):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)

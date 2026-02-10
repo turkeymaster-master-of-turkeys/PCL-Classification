@@ -6,37 +6,40 @@ import argparse
 import csv
 from pathlib import Path
 import numpy as np
+import warnings
+
+# Silence sharding warning from DistilBERT
+warnings.filterwarnings('ignore', message='.*were not sharded.*')
 
 from data import load_datasets
 from model import get_model, get_tokenizer, categories
 
 
-def pcl_score_to_target(scores):
+def focal_loss_fn(logits, targets, alpha=0.25, gamma=2.0):
     """
-    Convert PCL scores (0-4) to target probabilities:
-    - Score 0 -> p=0.0
-    - Score 1 -> p=0.5
-    - Score 2 -> p=0.75
-    - Score 3 -> p=1.0
-    - Score 4 -> p=1.0
+    Focal loss for multi-label classification.
+    
+    Args:
+        logits: predicted logits (before sigmoid)
+        targets: ground truth binary labels
+        alpha: weighting factor for positive class (default: 0.25)
+        gamma: focusing parameter (default: 2.0)
     """
-    targets = torch.zeros_like(scores, dtype=torch.float32)
-    targets[scores == 1] = 0.5
-    targets[scores == 2] = 0.75
-    targets[scores >= 3] = 1.0
-    return targets
+    probs = torch.sigmoid(logits)
+    bce_loss = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    p_t = probs * targets + (1 - probs) * (1 - targets)
+    focal_weight = (1 - p_t) ** gamma
+    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+    focal_loss = alpha_t * focal_weight * bce_loss
+    
+    return focal_loss.mean()
 
 
 def pcl_loss_fn(logits, pcl_scores):
     """
-    Custom loss for PCL prediction that rewards:
-    - p=0.5 for score 1
-    - p=1.0 for scores 3 and 4
-    - p=0.75 for score 2
-    - p=0.0 for score 0
+    Binary PCL loss: target 1 if pcl_score > 0, else 0
     """
-    targets = pcl_score_to_target(pcl_scores)
-    # Use BCE with logits
+    targets = (pcl_scores > 0).float()
     loss = nn.functional.binary_cross_entropy_with_logits(logits, targets)
     return loss
 
@@ -164,10 +167,10 @@ def main():
     # Prepare labels: convert scores to binary labels
     # Score 1 or 2 = presence (1), score 0 = absence (0)
     print("Preparing labels...")
-    train_labels = (train_df[categories] > 0).astype(int).values
+    train_labels = (train_df[categories] > 0).astype(int).values.copy()
     train_labels = torch.FloatTensor(train_labels)
     
-    val_labels = (val_df[categories] > 0).astype(int).values
+    val_labels = (val_df[categories] > 0).astype(int).values.copy()
     val_labels = torch.FloatTensor(val_labels)
     
     # Prepare PCL scores
@@ -215,17 +218,9 @@ def main():
     print(f"Loading model with classifier type: {args.classifier}")
     model = get_model(classifier_type=args.classifier)
     model = model.to(device)
+    print("Training LoRA adapters + classifier (base model frozen)...")
     
-    # Freeze BERT weights
-    print("Freezing BERT weights...")
-    for param in model.bert.parameters():
-        param.requires_grad = False
-    
-    # Setup loss function (BCE with logits for multi-label classification)
-    category_loss_fn = nn.BCEWithLogitsLoss()
-    
-    # Optimizer: only train classifier parameters
-    optimizer = optim.Adam(model.classifier.parameters(), lr=args.learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
     
     # Training loop with early stopping
     best_val_loss = float('inf')
@@ -286,7 +281,7 @@ def main():
             pcl_logits = logits_dict['pcl']
             
             # Compute losses
-            cat_loss = category_loss_fn(category_logits, labels)
+            cat_loss = focal_loss_fn(category_logits, labels)
             pcl_loss = pcl_loss_fn(pcl_logits, pcl_scores)
             loss = cat_loss + pcl_loss
             
@@ -324,7 +319,7 @@ def main():
                 pcl_logits = logits_dict['pcl']
                 
                 # Compute losses
-                cat_loss = category_loss_fn(category_logits, labels)
+                cat_loss = focal_loss_fn(category_logits, labels)
                 pcl_loss = pcl_loss_fn(pcl_logits, pcl_scores)
                 loss = cat_loss + pcl_loss
                 
