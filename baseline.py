@@ -1,7 +1,6 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
-import shutil
-from pathlib import Path
 from datasets import Dataset
 from sklearn.metrics import f1_score
 from transformers import (
@@ -12,6 +11,40 @@ from transformers import (
     DataCollatorWithPadding,
     EarlyStoppingCallback,
 )
+
+
+class FocalLossTrainer(Trainer):
+    def __init__(self, *args, alpha=0.25, gamma=2.0, problem_type="single_label_classification", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.alpha = alpha
+        self.gamma = gamma
+        self.problem_type = problem_type
+    
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+        
+        if self.problem_type == "multi_label_classification":
+            # Multi-label focal loss with BCEWithLogitsLoss
+            bce_loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
+            pt = torch.exp(-bce_loss)
+            # For multi-label, alpha is a vector - apply per-label weighting
+            if isinstance(self.alpha, torch.Tensor):
+                alpha = self.alpha.view(1, -1).to(logits.device)
+            else:
+                alpha = self.alpha
+            focal_loss = alpha * (1 - pt) ** self.gamma * bce_loss
+            loss = focal_loss.mean()
+        else:
+            # Single-label focal loss with CrossEntropyLoss
+            ce_loss = F.cross_entropy(logits, labels, reduction='none')
+            pt = torch.exp(-ce_loss)
+            focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+            loss = focal_loss.mean()
+        
+        return (loss, outputs) if return_outputs else loss
+
 
 class BaseTransformerClassifier:
     def __init__(
@@ -77,12 +110,51 @@ class BaseTransformerClassifier:
         
         return {"f1": f1}
     
+    def _calculate_alpha(self, train_df):
+        """Calculate alpha based on class distribution in training data."""
+        if self.problem_type == "multi_label_classification":
+            # For multi-label, calculate alpha for each label
+            labels_array = np.array(train_df['label'].tolist())
+            num_samples = len(labels_array)
+            num_labels = labels_array.shape[1]
+            
+            alphas = []
+            for i in range(num_labels):
+                pos_count = labels_array[:, i].sum()
+                neg_count = num_samples - pos_count
+                # Calculate alpha as the ratio of negative to positive samples
+                if pos_count > 0:
+                    alpha = neg_count / pos_count
+                else:
+                    alpha = 1.0
+                alphas.append(min(alpha, 10.0))  # Clip to 10
+            
+            return torch.tensor(alphas, dtype=torch.float32)
+        else:
+            # For single-label, calculate alpha for minority class
+            label_counts = train_df['label'].value_counts()
+            
+            if len(label_counts) > 1:
+                # Calculate inverse frequency, normalized
+                max_count = label_counts.max()
+                min_count = label_counts.min()
+                alpha = min(max_count / min_count, 10.0)  # Clip to 10
+            else:
+                alpha = 1.0
+            
+            return alpha
+    
     def get_trainers(self, train_df):
         # Split into 80% train, 20% validation
         train_df = train_df.sample(frac=1, random_state=42).reset_index(drop=True)
         split_idx = int(len(train_df) * 0.8)
         train_split = train_df.iloc[:split_idx]
         val_split = train_df.iloc[split_idx:]
+        
+        # Calculate alpha from training split
+        alpha = self._calculate_alpha(train_split)
+        if self.problem_type == "multi_label_classification":
+            alpha = alpha.to(self.device)
         
         train_dataset = self._prepare_dataset(train_split)
         val_dataset = self._prepare_dataset(val_split)
@@ -101,11 +173,13 @@ class BaseTransformerClassifier:
             greater_is_better=True,
         )
         
-        trainer = Trainer(
+        trainer = FocalLossTrainer(
             model=self.model,
             args=training_args,
             data_collator=self.data_collator,
             compute_metrics=self.compute_metrics,
+            problem_type=self.problem_type,
+            alpha=alpha,
             callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
@@ -121,11 +195,13 @@ class BaseTransformerClassifier:
             eval_strategy="epoch",
             report_to="none",
         )
-        warmup_trainer = Trainer(
+        warmup_trainer = FocalLossTrainer(
             model=self.model,
             args=warmup_args,
             data_collator=self.data_collator,
             compute_metrics=self.compute_metrics,
+            problem_type=self.problem_type,
+            alpha=alpha,
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
         )
