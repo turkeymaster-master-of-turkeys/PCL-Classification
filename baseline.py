@@ -3,6 +3,7 @@ import numpy as np
 import shutil
 from pathlib import Path
 from datasets import Dataset
+from sklearn.metrics import f1_score
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
@@ -62,6 +63,20 @@ class BaseTransformerClassifier:
 
         return dataset
     
+    def compute_metrics(self, eval_pred):
+        predictions, labels = eval_pred
+        
+        if self.problem_type == "multi_label_classification":
+            # Apply sigmoid and threshold for multi-label
+            predictions = (torch.sigmoid(torch.tensor(predictions)).numpy() >= 0.5).astype(int)
+            f1 = f1_score(labels, predictions, average='macro', zero_division=0)
+        else:
+            # Single-label classification
+            predictions = np.argmax(predictions, axis=1)
+            f1 = f1_score(labels, predictions, average='binary', zero_division=0)
+        
+        return {"f1": f1}
+    
     def get_trainers(self, train_df):
         # Split into 80% train, 20% validation
         train_df = train_df.sample(frac=1, random_state=42).reset_index(drop=True)
@@ -73,7 +88,7 @@ class BaseTransformerClassifier:
         val_dataset = self._prepare_dataset(val_split)
         
         training_args = TrainingArguments(
-            output_dir="./results",
+            output_dir="./checkpoints",
             num_train_epochs=self.num_train_epochs,
             per_device_train_batch_size=self.batch_size,
             per_device_eval_batch_size=self.batch_size,
@@ -82,20 +97,22 @@ class BaseTransformerClassifier:
             eval_strategy="epoch",
             report_to="none",
             load_best_model_at_end=True,
-            metric_for_best_model="loss",
+            metric_for_best_model="f1",
+            greater_is_better=True,
         )
         
         trainer = Trainer(
             model=self.model,
             args=training_args,
             data_collator=self.data_collator,
+            compute_metrics=self.compute_metrics,
             callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
         )
         
         warmup_args = TrainingArguments(
-            output_dir="./results",
+            output_dir="./results_warmup",
             num_train_epochs=1,
             per_device_train_batch_size=self.batch_size,
             per_device_eval_batch_size=self.batch_size,
@@ -108,6 +125,7 @@ class BaseTransformerClassifier:
             model=self.model,
             args=warmup_args,
             data_collator=self.data_collator,
+            compute_metrics=self.compute_metrics,
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
         )
@@ -131,14 +149,6 @@ class BaseTransformerClassifier:
             param.requires_grad = True
         
         self.trainer.train()
-        
-        results_dir = Path("./results")
-        if results_dir.exists():
-            for item in results_dir.iterdir():
-                if item.is_dir() and item.name.startswith("checkpoint"):
-                    shutil.rmtree(item)
-        
-        self.model.save_pretrained("./checkpoints/best_model.pt")
 
     def predict(self, texts, threshold=0.5):
         dataset = Dataset.from_dict({"text": texts})
