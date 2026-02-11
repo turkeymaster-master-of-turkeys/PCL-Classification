@@ -1,5 +1,7 @@
 import torch
 import numpy as np
+import shutil
+from pathlib import Path
 from datasets import Dataset
 from transformers import (
     AutoTokenizer,
@@ -7,49 +9,32 @@ from transformers import (
     Trainer,
     TrainingArguments,
     DataCollatorWithPadding,
+    EarlyStoppingCallback,
 )
 
 class BaseTransformerClassifier:
     def __init__(
         self,
-        model_name="roberta-base",
-        num_labels=2,
+        model,
+        tokenizer,
         num_train_epochs=20,
         batch_size=16,
         use_cuda=True,
         problem_type="single_label_classification",  # or "multi_label_classification"
     ):
-        self.problem_type = problem_type
-
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() and use_cuda else "cpu"
         )
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.problem_type = problem_type
+        self.tokenizer = tokenizer
 
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_name,
-            num_labels=num_labels,
-            problem_type=problem_type,
-        ).to(self.device)
-
-        self.training_args = TrainingArguments(
-            output_dir="./results",
-            num_train_epochs=num_train_epochs,
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            save_strategy="no",
-            logging_strategy="epoch",
-            report_to="none",
-        )
+        self.model = model.to(self.device)
 
         self.data_collator = DataCollatorWithPadding(self.tokenizer)
-
-        self.trainer = Trainer(
-            model=self.model,
-            args=self.training_args,
-            data_collator=self.data_collator,
-        )
+        self.trainer = None
+        self.num_train_epochs = num_train_epochs
+        self.batch_size = batch_size
 
     def _tokenize(self, batch):
         return self.tokenizer(
@@ -76,12 +61,83 @@ class BaseTransformerClassifier:
             )
 
         return dataset
+    
+    def get_trainers(self, train_df):
+        # Split into 80% train, 20% validation
+        train_df = train_df.sample(frac=1, random_state=42).reset_index(drop=True)
+        split_idx = int(len(train_df) * 0.8)
+        train_split = train_df.iloc[:split_idx]
+        val_split = train_df.iloc[split_idx:]
+        
+        train_dataset = self._prepare_dataset(train_split)
+        val_dataset = self._prepare_dataset(val_split)
+        
+        training_args = TrainingArguments(
+            output_dir="./results",
+            num_train_epochs=self.num_train_epochs,
+            per_device_train_batch_size=self.batch_size,
+            per_device_eval_batch_size=self.batch_size,
+            save_strategy="epoch",
+            logging_strategy="epoch",
+            eval_strategy="epoch",
+            report_to="none",
+            load_best_model_at_end=True,
+            metric_for_best_model="loss",
+        )
+        
+        trainer = Trainer(
+            model=self.model,
+            args=training_args,
+            data_collator=self.data_collator,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+        )
+        
+        warmup_args = TrainingArguments(
+            output_dir="./results",
+            num_train_epochs=1,
+            per_device_train_batch_size=self.batch_size,
+            per_device_eval_batch_size=self.batch_size,
+            save_strategy="no",
+            logging_strategy="epoch",
+            eval_strategy="epoch",
+            report_to="none",
+        )
+        warmup_trainer = Trainer(
+            model=self.model,
+            args=warmup_args,
+            data_collator=self.data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+        )
 
+        return warmup_trainer, trainer
 
     def train_model(self, train_df):
-        dataset = self._prepare_dataset(train_df)
-        self.trainer.train_dataset = dataset
+        warmup_trainer, self.trainer = self.get_trainers(train_df)
+        
+        trainable_params = [param for param in self.model.parameters() if param.requires_grad]
+        for param in self.model.parameters():
+            param.requires_grad = False
+        for param in self.model.classifier.parameters():
+            param.requires_grad = True
+
+        warmup_trainer.train()
+        
+        for param in self.model.classifier.parameters():
+            param.requires_grad = False
+        for param in trainable_params:
+            param.requires_grad = True
+        
         self.trainer.train()
+        
+        results_dir = Path("./results")
+        if results_dir.exists():
+            for item in results_dir.iterdir():
+                if item.is_dir() and item.name.startswith("checkpoint"):
+                    shutil.rmtree(item)
+        
         self.model.save_pretrained("./checkpoints/best_model.pt")
 
     def predict(self, texts, threshold=0.5):
@@ -103,15 +159,39 @@ class BaseTransformerClassifier:
 
 class RobertaClassifier(BaseTransformerClassifier):
     def __init__(self, **kwargs):
+        model_name = "roberta-base"
+        problem_type = "single_label_classification"
+        
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_name,
+            num_labels=2,
+            problem_type=problem_type,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
         super().__init__(
-            problem_type="single_label_classification",
+            model=model,
+            tokenizer=tokenizer,
+            problem_type=problem_type,
             **kwargs
         )
 
 
 class RobertaMultiLabelClassifier(BaseTransformerClassifier):
     def __init__(self, **kwargs):
+        model_name = "roberta-base"
+        problem_type = "multi_label_classification"
+        
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_name,
+            num_labels=7,
+            problem_type=problem_type,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
         super().__init__(
-            problem_type="multi_label_classification",
+            model=model,
+            tokenizer=tokenizer,
+            problem_type=problem_type,
             **kwargs
         )
