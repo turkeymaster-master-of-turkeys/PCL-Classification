@@ -14,7 +14,7 @@ from transformers import (
 
 
 class FocalLossTrainer(Trainer):
-    def __init__(self, *args, alpha=0.25, gamma=2.0, problem_type="single_label_classification", **kwargs):
+    def __init__(self, *args, alpha=4.4, gamma=2.0, problem_type="single_label_classification", **kwargs):
         super().__init__(*args, **kwargs)
         self.alpha = alpha
         self.gamma = gamma
@@ -23,15 +23,13 @@ class FocalLossTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels").float()  # shape (B,8)
         outputs = model(**inputs)
-        logits = outputs.logits                # shape (B, 8)
+        logits = outputs['logits']                # shape (B, 8)
 
         bce_loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')  # (B,)
         probs = torch.sigmoid(logits)
-        pt = torch.where(labels == 1, probs, 1 - probs)                                  # (B,)
+        pt = torch.where(labels == 1, probs, 1 - probs)
 
-        alpha_t = self.alpha.view(1, -1)   # shape (B,)
-
-        focal_loss = alpha_t * (1 - pt) ** self.gamma * bce_loss
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
         loss = focal_loss.mean()
         
         return (loss, outputs) if return_outputs else loss
@@ -284,27 +282,18 @@ class AttentionJointClassifier(BaseTransformerClassifier):
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         latent_size = 32
         num_categories = 7
+        problem_type = "multi_label_classification"
         
         class JointClassifier(torch.nn.Module):
-            def __init__(self, base_model):
+            def __init__(self, latent_size, num_categories):
                 super().__init__()
-                self.base_model = base_model
                 self.latent_proj = torch.nn.ModuleList([torch.nn.Linear(base_model.config.hidden_size, latent_size) for _ in range(num_categories + 1)])
                 self.attn = torch.nn.MultiheadAttention(embed_dim=latent_size, num_heads=1, batch_first=True)
                 self.category_classifiers = torch.nn.ModuleList([torch.nn.Linear(latent_size, 1) for _ in range(num_categories)])
                 self.pcl_classifier = torch.nn.Linear(latent_size * (num_categories + 1), 1)
-                # Group classification layers for easier access during training
-                self.classifier = torch.nn.ModuleDict({
-                    'latent_proj': self.latent_proj,
-                    'attn': self.attn,
-                    'category': self.category_classifiers,
-                    'pcl': self.pcl_classifier
-                })
-
-            def forward(self, input_ids, attention_mask, **kwargs):
-                outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
-                pooled_output = outputs.last_hidden_state[:, 0]
-                latents = [proj(pooled_output) for proj in self.latent_proj]
+                
+            def forward(self, x):
+                latents = [proj(x) for proj in self.latent_proj]
                 category_latents = latents[:-1]
                 pcl_latent = latents[-1]
                 category_latents = torch.stack(category_latents, dim=1)  # (batch, 7, latent_size)
@@ -319,11 +308,23 @@ class AttentionJointClassifier(BaseTransformerClassifier):
                 logits = torch.cat([category_logits, pcl_logits], dim=1)  # (batch, 8)
                 
                 # Return output in the same format as transformers models
-                return type('obj', (object,), {'logits': logits})()
+                return logits
+        
+        class JointModel(torch.nn.Module):
+            def __init__(self, base_model):
+                super().__init__()
+                self.base_model = base_model
+                self.classifier = JointClassifier(latent_size, num_categories)
+
+            def forward(self, input_ids, attention_mask, labels=None, **kwargs):
+                outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = self.classifier(outputs.last_hidden_state[:, 0])
+                return {"logits": logits}
             
         super().__init__(
-            model=JointClassifier(base_model),
+            model=JointModel(base_model),
             tokenizer=tokenizer,
+            problem_type=problem_type,
             **kwargs
         )
 
