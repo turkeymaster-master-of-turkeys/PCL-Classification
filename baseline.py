@@ -14,25 +14,24 @@ from transformers import (
 
 
 class FocalLossTrainer(Trainer):
-    def __init__(self, *args, alpha=0.25, gamma=2.0, **kwargs):
+    def __init__(self, *args, alpha=0.25, gamma=2.0, problem_type="single_label_classification", **kwargs):
         super().__init__(*args, **kwargs)
         self.alpha = alpha
         self.gamma = gamma
+        self.problem_type = problem_type
     
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        labels = inputs.pop("labels")
+        labels = inputs.pop("labels").float()  # shape (B,8)
         outputs = model(**inputs)
-        logits = outputs.logits
-        
-        # Multi-label focal loss with BCEWithLogitsLoss
-        bce_loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
-        pt = torch.exp(-bce_loss)
-        # For multi-label, alpha is a vector - apply per-label weighting
-        if isinstance(self.alpha, torch.Tensor):
-            alpha = self.alpha.view(1, -1).to(logits.device)
-        else:
-            alpha = self.alpha
-        focal_loss = alpha * (1 - pt) ** self.gamma * bce_loss
+        logits = outputs.logits                # shape (B, 8)
+
+        bce_loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')  # (B,)
+        probs = torch.sigmoid(logits)
+        pt = torch.where(labels == 1, probs, 1 - probs)                                  # (B,)
+
+        alpha_t = self.alpha.view(1, -1)   # shape (B,)
+
+        focal_loss = alpha_t * (1 - pt) ** self.gamma * bce_loss
         loss = focal_loss.mean()
         
         return (loss, outputs) if return_outputs else loss
@@ -46,18 +45,18 @@ class BaseTransformerClassifier:
         num_train_epochs=20,
         batch_size=16,
         use_cuda=True,
+        problem_type="single_label_classification",  # or "multi_label_classification"
     ):
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() and use_cuda else "cpu"
         )
 
+        self.problem_type = problem_type
         self.tokenizer = tokenizer
 
         self.model = model.to(self.device)
 
         self.data_collator = DataCollatorWithPadding(self.tokenizer)
-        from transformers import default_data_collator
-        self.data_collator = default_data_collator
         self.trainer = None
         self.num_train_epochs = num_train_epochs
         self.batch_size = batch_size
@@ -66,58 +65,77 @@ class BaseTransformerClassifier:
         return self.tokenizer(
             batch["text"],
             truncation=True,
-            padding="max_length",
+            padding=False,
             max_length=128,
         )
 
     def _prepare_dataset(self, df):
         dataset = Dataset.from_pandas(df.copy())
         dataset = dataset.map(self._tokenize, batched=True)
+
         dataset = dataset.remove_columns(["text"])
-        
-        def format_labels(example):
-            return {"labels": [float(x) for x in example["labels"]]}
-        
-        dataset = dataset.map(format_labels)
+        dataset = dataset.rename_column("label", "labels")
+
+        # Convert to torch tensors
         dataset.set_format("torch")
+
+        if self.problem_type == "multi_label_classification":
+            # Ensure labels are float32 for BCEWithLogitsLoss
+            dataset = dataset.map(
+                lambda x: {"labels": torch.tensor(x["labels"], dtype=torch.float32)}
+            )
 
         return dataset
     
     def compute_metrics(self, eval_pred):
         predictions, labels = eval_pred
         
-        # Apply sigmoid and threshold for multi-label
-        predictions = (torch.sigmoid(torch.tensor(predictions)).numpy() >= 0.5).astype(int)
-        f1 = f1_score(labels, predictions, average='macro', zero_division=0)
+        if self.problem_type == "multi_label_classification":
+            labels = labels[:, -1]
+            predictions = predictions[:, -1]
+            # Apply sigmoid and threshold for multi-label
+            predictions = (torch.sigmoid(torch.tensor(predictions)).numpy() >= 0.5).astype(int)
+            f1 = f1_score(labels, predictions, average='macro', zero_division=0)
+        else:
+            # Single-label classification
+            predictions = np.argmax(predictions, axis=1)
+            f1 = f1_score(labels, predictions, average='binary', zero_division=0)
         
-        # Compute separate F1 for categories and PCL
-        categories_f1 = f1_score(labels[:, :-1], predictions[:, :-1], average='macro', zero_division=0)
-        pcl_f1 = f1_score(labels[:, -1], predictions[:, -1], average='binary', zero_division=0)
-        return {"f1": f1, "categories_f1": categories_f1, "pcl_f1": pcl_f1}
+        return {"f1": f1}
     
     def _calculate_alpha(self, train_df):
         """Calculate alpha based on class distribution in training data."""
-        import ast
-        
-        # Parse labels if they're stored as strings
-        labels_list = train_df['labels'].tolist()
-        labels_array = np.array(labels_list)  # Shape: (num_samples, 8)
-        
-        num_samples = len(train_df)
-        num_labels = labels_array.shape[1]  # Should be 8
-        
-        alphas = []
-        # Calculate alpha for each label (7 categories + 1 PCL)
-        for i in range(num_labels):
-            pos_count = labels_array[:, i].sum()
-            neg_count = num_samples - pos_count
-            if pos_count > 0:
-                alpha = neg_count / pos_count
+        if self.problem_type == "multi_label_classification":
+            # For multi-label, calculate alpha for each label
+            labels_array = np.array(train_df['label'].tolist())
+            num_samples = len(labels_array)
+            num_labels = labels_array.shape[1]
+            
+            alphas = []
+            for i in range(num_labels):
+                pos_count = labels_array[:, i].sum()
+                neg_count = num_samples - pos_count
+                # Calculate alpha as the ratio of negative to positive samples
+                if pos_count > 0:
+                    alpha = neg_count / pos_count
+                else:
+                    alpha = 1.0
+                alphas.append(min(alpha, 10.0))  # Clip to 10
+            
+            return torch.tensor(alphas, dtype=torch.float32)
+        else:
+            # For single-label, calculate alpha for minority class
+            label_counts = train_df['label'].value_counts()
+            
+            if len(label_counts) > 1:
+                # Calculate inverse frequency, normalized
+                max_count = label_counts.max()
+                min_count = label_counts.min()
+                alpha = min(max_count / min_count, 10.0)  # Clip to 10
             else:
                 alpha = 1.0
-            alphas.append(min(alpha, 10.0))  # Clip to 10
-        
-        return torch.tensor(alphas, dtype=torch.float32)
+            
+            return alpha
     
     def get_trainers(self, train_df):
         # Split into 80% train, 20% validation
@@ -127,7 +145,9 @@ class BaseTransformerClassifier:
         val_split = train_df.iloc[split_idx:]
         
         # Calculate alpha from training split
-        alpha = self._calculate_alpha(train_split).to(self.device)
+        alpha = self._calculate_alpha(train_split)
+        if self.problem_type == "multi_label_classification":
+            alpha = alpha.to(self.device)
         
         train_dataset = self._prepare_dataset(train_split)
         val_dataset = self._prepare_dataset(val_split)
@@ -142,7 +162,7 @@ class BaseTransformerClassifier:
             eval_strategy="epoch",
             report_to="none",
             load_best_model_at_end=True,
-            metric_for_best_model="pcl_f1",
+            metric_for_best_model="f1",
             greater_is_better=True,
         )
         
@@ -151,6 +171,7 @@ class BaseTransformerClassifier:
             args=training_args,
             data_collator=self.data_collator,
             compute_metrics=self.compute_metrics,
+            problem_type=self.problem_type,
             alpha=alpha,
             callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
             train_dataset=train_dataset,
@@ -172,6 +193,7 @@ class BaseTransformerClassifier:
             args=warmup_args,
             data_collator=self.data_collator,
             compute_metrics=self.compute_metrics,
+            problem_type=self.problem_type,
             alpha=alpha,
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
@@ -205,31 +227,51 @@ class BaseTransformerClassifier:
         outputs = self.trainer.predict(dataset)
         logits = outputs.predictions
 
-        probs = torch.sigmoid(torch.tensor(logits)).numpy()
-        preds = (probs >= threshold).astype(int)
-        
-        # Return categories and PCL predictions separately
-        return {
-            "categories": preds[:, :-1],
-            "pcl": preds[:, -1],
-            "categories_probs": probs[:, :-1],
-            "pcl_probs": probs[:, -1]
-        }
+        if self.problem_type == "multi_label_classification":
+            probs = torch.sigmoid(torch.tensor(logits)).numpy()
+            preds = (probs >= threshold).astype(int)
+            return preds, probs
+        else:
+            preds = np.argmax(logits, axis=1)
+            return preds, logits
 
 
-class RobertaJointClassifier(BaseTransformerClassifier):
+class RobertaClassifier(BaseTransformerClassifier):
     def __init__(self, **kwargs):
         model_name = "roberta-base"
+        problem_type = "single_label_classification"
         
         model = AutoModelForSequenceClassification.from_pretrained(
             model_name,
-            num_labels=8,  # 7 categories + 1 PCL
+            num_labels=2,
+            problem_type=problem_type,
         )
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         
         super().__init__(
             model=model,
             tokenizer=tokenizer,
+            problem_type=problem_type,
+            **kwargs
+        )
+
+
+class RobertaMultiLabelClassifier(BaseTransformerClassifier):
+    def __init__(self, **kwargs):
+        model_name = "roberta-base"
+        problem_type = "multi_label_classification"
+        
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_name,
+            num_labels=8,
+            problem_type=problem_type,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        super().__init__(
+            model=model,
+            tokenizer=tokenizer,
+            problem_type=problem_type,
             **kwargs
         )
 
@@ -284,3 +326,4 @@ class AttentionJointClassifier(BaseTransformerClassifier):
             tokenizer=tokenizer,
             **kwargs
         )
+
