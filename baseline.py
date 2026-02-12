@@ -69,7 +69,7 @@ class BaseTransformerClassifier:
             batch["text"],
             truncation=True,
             padding=False,
-            max_length=128,
+            max_length=256,
         )
 
     def _prepare_dataset(self, df):
