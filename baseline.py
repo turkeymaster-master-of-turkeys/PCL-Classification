@@ -46,6 +46,7 @@ class BaseTransformerClassifier:
         tokenizer,
         num_train_epochs=20,
         batch_size=16,
+        learning_rate=1e-4,
         use_cuda=True
     ):
         self.device = torch.device(
@@ -60,7 +61,7 @@ class BaseTransformerClassifier:
         self.trainer = None
         self.num_train_epochs = num_train_epochs
         self.batch_size = batch_size
-        
+        self.learning_rate = learning_rate
         self.val_dataset = None
         self.threshold = 0.5
 
@@ -139,7 +140,7 @@ class BaseTransformerClassifier:
             report_to="none",
             metric_for_best_model="f1",
             greater_is_better=True,
-            learning_rate=1e-4,
+            learning_rate=self.learning_rate,
         )
         
         trainer = FocalLossTrainer(
@@ -161,7 +162,7 @@ class BaseTransformerClassifier:
             logging_strategy="epoch",
             eval_strategy="epoch",
             report_to="none",
-            learning_rate=1e-4,
+            learning_rate=self.learning_rate,
         )
         warmup_trainer = FocalLossTrainer(
             model=self.model,
@@ -236,12 +237,20 @@ class BaseTransformerClassifier:
 
 class RobertaMultiLabelClassifier(BaseTransformerClassifier):
     def __init__(self, **kwargs):
+        import peft
         model_name = "roberta-base"
         
         model = AutoModelForSequenceClassification.from_pretrained(
             model_name,
             num_labels=8,
         )
+        peft_config = peft.LoraConfig(
+            r=16,
+            lora_alpha=32,
+            task_type=peft.TaskType.TOKEN_CLS,
+            target_modules=["query", "value", "key"]
+        )
+        model = peft.get_peft_model(model, peft_config)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         
         super().__init__(
@@ -252,8 +261,8 @@ class RobertaMultiLabelClassifier(BaseTransformerClassifier):
 
 
 class AttentionJointClassifier(BaseTransformerClassifier):
-    def __init__(self, classifier_type='attn', **kwargs):
-        model = AttentionJointClassifier.get_model(classifier_type)
+    def __init__(self, **kwargs):
+        model = AttentionJointClassifier.get_model()
         tokenizer = AutoTokenizer.from_pretrained('roberta-base')
         super().__init__(
             model=model,
@@ -262,13 +271,13 @@ class AttentionJointClassifier(BaseTransformerClassifier):
         )
         
     @classmethod
-    def get_model(cls, classifier_type='attn'):
+    def get_model(cls):
         latent_size = 32
         num_categories = 7
         model_name = "roberta-base"
         from transformers import AutoModel
         import peft
-        base_model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float32)
+        base_model = AutoModel.from_pretrained(model_name, dtype=torch.float32)
         
         peft_config = peft.LoraConfig(
             r=16,
@@ -304,24 +313,11 @@ class AttentionJointClassifier(BaseTransformerClassifier):
                 # Return output in the same format as transformers models
                 return logits
         
-        class ProjClassifier(torch.nn.Module):
-            def __init__(self, latent_size, num_categories):
-                super().__init__()
-                self.latent_proj = torch.nn.Linear(768, latent_size)
-                self.out_proj = torch.nn.Linear(latent_size, 8)
-            
-            def forward(self, x):
-                x = self.latent_proj(x)
-                return self.out_proj(x)
-        
         class JointModel(torch.nn.Module):
             def __init__(self, base_model):
                 super().__init__()
                 self.base_model = base_model
-                if classifier_type == 'attn':
-                    self.classifier = AttnClassifier(latent_size, num_categories)
-                else:
-                    self.classifier = ProjClassifier(latent_size, num_categories)
+                self.classifier = AttnClassifier(latent_size, num_categories)
             
             def forward(self, input_ids, attention_mask, labels=None, **kwargs):
                 outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
@@ -332,13 +328,13 @@ class AttentionJointClassifier(BaseTransformerClassifier):
 
 
 class EnsembleClassifier(BaseTransformerClassifier):
-    def __init__(self, classifier_type='attn', num_models=3, **kwargs):
+    def __init__(self, num_models=3, **kwargs):
         tokenizer = AutoTokenizer.from_pretrained('roberta-base')
         
         class EnsembleModel(torch.nn.Module):
-            def __init__(self, classifier_type, num_models):
+            def __init__(self):
                 super().__init__()
-                self.models = [AttentionJointClassifier.get_model(classifier_type) for _ in range(num_models)]
+                self.models = [AttentionJointClassifier.get_model(), RobertaMultiLabelClassifier()]
                 self.model_modules = torch.nn.ModuleList([model.base_model for model in self.models])
                 self.classifier = torch.nn.ModuleList([model.classifier for model in self.models])
             def forward(self, input_ids, attention_mask, labels=None, **kwargs):
@@ -348,7 +344,7 @@ class EnsembleClassifier(BaseTransformerClassifier):
                 return {"logits": logits}
         
         super().__init__(
-            model=EnsembleModel(classifier_type, num_models),
+            model=EnsembleModel(),
             tokenizer=tokenizer,
             **kwargs
         )
